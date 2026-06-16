@@ -81,9 +81,3 @@ How it works
 
 A practical import + sync walkthrough is available at
 https://icinga.com/docs/icinga-director/latest/doc/70-Import-and-Sync/
-
-Credits
--------
-Inspired by [icingaweb2-module-azgraph](../icingaweb2-module-azgraph) and
-[icingaweb2-module-azure](https://github.com/credativ/icingaweb2-module-azure),
-both published under the MIT licence.

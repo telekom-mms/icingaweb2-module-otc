@@ -1,0 +1,6 @@
+Name: Otc
+Version: 0.1.0
+Depends: director (>=1.3.0)
+Description: Open Telekom Cloud (T-Cloud Public) module for Icinga Web 2 Director
+ Provides an OTC import source for Icinga Director via OpenStack Keystone v3.
+ Resources are discovered automatically from the service catalog – no hardcoding.

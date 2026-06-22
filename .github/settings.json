@@ -1,0 +1,14 @@
+{
+  "repos": {
+    "description": "Icinga Web 2 module for the Open Telekom Cloud (OTC) API",
+    "visibility": "public",
+    "default_branch": "main",
+    "homepage": "https://telekom-mms.github.io/icingaweb2-module-otc/",
+    "topics": [
+      "icingaweb2",
+      "otc",
+      "open-telekom-cloud",
+      "cloud-monitoring"
+    ]
+  }
+}

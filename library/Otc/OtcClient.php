@@ -458,18 +458,25 @@ class OtcClient
     }
 
     /**
-     * Return the top-level keys of the first resource as column names.
+     * Return the union of all top-level keys across every resource as column names.
      * These are the fields available for Icinga Director sync rules.
+     *
+     * Iterating all resources (not just $resources[0]) ensures that columns
+     * which appear only on some objects – e.g. "addresses_debug" added during
+     * enrichment – are visible in Director's column picker.
      *
      * @param  array $resources  as returned by extractResources()
      * @return array
      */
     public function extractColumns(array $resources)
     {
-        if (empty($resources)) {
-            return [];
+        $columns = [];
+        foreach ($resources as $resource) {
+            foreach (array_keys((array) $resource) as $col) {
+                $columns[$col] = true;
+            }
         }
-        return array_keys($resources[0]);
+        return array_keys($columns);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

@@ -23,11 +23,17 @@ class ImportSource extends ImportSourceHook
      * fetch all resource pages and return them as an array of stdClass objects.
      *
      * When the setting `enrich_subnet_names` is truthy the `addresses` field of
-     * every compute resource is re-keyed from opaque network UUIDs (or VPC names)
-     * to human-readable subnet names derived from CIDR matching.  This allows a
-     * downstream PropertyModifierArrayElementByKeyPattern modifier to reliably
-     * select a specific NIC by name pattern (e.g. "*mgmt*") instead of blindly
-     * taking the first element.
+     * every compute resource is re-keyed from opaque network UUIDs to
+     * human-readable names derived from:
+     *   1. Subnet CIDR lookup (fast, no extra API calls per server)
+     *   2. Fallback: per-server Ports API → subnet_id → subnet_name
+     *      (works in Shared VPCs where CIDR ranges overlap across projects)
+     *
+     * Only servers with more than one NIC are enriched; single-NIC servers
+     * keep the UUID key and the modifier falls back to "first" automatically.
+     *
+     * This allows a downstream PropertyModifierIpBySubnetName modifier to
+     * reliably select a specific NIC by name pattern (e.g. "*mgmt*").
      */
     public function fetchData()
     {
@@ -60,24 +66,272 @@ class ImportSource extends ImportSourceHook
             return [];
         }
 
-        // Optionally enrich addresses with subnet names (CIDR-based re-keying)
+        // Optionally enrich addresses with subnet/network names
         if ($this->isTrue($this->getSetting('enrich_subnet_names', ''))) {
             try {
                 $networkEndpoint = $this->client->getEndpoint('network', $region);
-                $subnetPages     = $this->client->get($networkEndpoint . '/subnets');
-                $subnets         = $this->client->extractResources($subnetPages);
 
-                Logger::info(sprintf(
-                    'OTC ImportSource: enriching addresses with %d subnet name(s)',
-                    count($subnets)
-                ));
+                // OTC/Huawei Cloud VPC: the service catalog often returns a bare
+                // host URL (https://vpc.eu-de.otc.t-systems.com) without a version
+                // prefix.  The Neutron-compatible API requires /v2.0/.
+                // Auto-detect: if the path component is empty or just '/', append /v2.0.
+                $catalogPath = parse_url($networkEndpoint, PHP_URL_PATH);
+                if (empty($catalogPath) || $catalogPath === '/') {
+                    $networkApiPath  = '/' . ltrim($this->getSetting('network_api_path', 'v2.0'), '/');
+                    $networkEndpoint = $networkEndpoint . $networkApiPath;
+                    Logger::info('OTC ImportSource: bare network endpoint detected, appended ' . $networkApiPath);
+                }
 
-                $this->resources = $this->enrichAddressesWithSubnetNames($this->resources, $subnets);
+                Logger::info('OTC ImportSource: starting enrichment, network endpoint: ' . $networkEndpoint);
+
+                // Tier 1: CIDR matching (fast, single-tenant only)
+                $subnets = [];
+                try {
+                    $subnetPages = $this->client->get($networkEndpoint . '/subnets');
+                    $subnets     = $this->client->extractResources($subnetPages);
+                    Logger::info(sprintf('OTC ImportSource: CIDR enrichment with %d subnet(s)', count($subnets)));
+                } catch (\Exception $e) {
+                    Logger::warning('OTC ImportSource: subnet listing unavailable: ' . $e->getMessage());
+                }
+
+                // Tier 2: Network UUID → name (Shared VPC fallback)
+                $networkPages = $this->client->get($networkEndpoint . '/networks');
+                $networks     = $this->client->extractResources($networkPages);
+                Logger::info(sprintf('OTC ImportSource: networks enrichment with %d network(s)', count($networks)));
+
+                // Tier 2+3: Per-server enrichment via CIDR (fast) then Ports API (fallback).
+                // In Shared VPC we MUST query ports per device, not all ports at once.
+                $resources = &$this->resources;
+                foreach ($resources as &$resource) {
+                    if (empty($resource['id'])) {
+                        continue;
+                    }
+                    $serverId = $resource['id'];
+
+                    // Skip if already enriched (no raw UUID keys left)
+                    $hasUuidKey = false;
+                    if (!empty($resource['addresses']) && is_array($resource['addresses'])) {
+                        foreach (array_keys($resource['addresses']) as $key) {
+                            if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $key)) {
+                                $hasUuidKey = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!$hasUuidKey) {
+                        continue; // already enriched
+                    }
+
+                    // Count total IPs across all network keys.
+                    // With a single NIC the UUID key is irrelevant – the modifier
+                    // falls back to "first" anyway, so enrichment buys nothing.
+                    $totalIps = 0;
+                    foreach ($resource['addresses'] as $addrList) {
+                        $totalIps += count((array) $addrList);
+                    }
+                    if ($totalIps <= 1) {
+                        continue; // single NIC – no enrichment needed
+                    }
+
+                    try {
+                        $ipToSubnetName  = [];  // ip_address  → subnet_name  (precise, per IP)
+                        $macToSubnetName = [];  // mac_address → subnet_name  (fallback)
+                        $subnetIdCache   = [];  // subnet_id   → subnet_name  (avoids duplicate API calls)
+                        $debugMap        = [];  // written to addresses_debug for inspection
+
+                        // --- Tier 1: CIDR pre-matching (no extra API calls) ---
+                        // Match every IP in this server's addresses against the
+                        // already-fetched $subnets list.  Avoids per-server ports
+                        // API calls when all IPs resolve via CIDR (single-tenant).
+                        if (!empty($subnets) && !empty($resource['addresses']) && is_array($resource['addresses'])) {
+                            foreach ($resource['addresses'] as $addrList) {
+                                foreach ((array) $addrList as $addrObj) {
+                                    $addrArr = (array) $addrObj;
+                                    $ip = $addrArr['addr'] ?? null;
+                                    if ($ip === null || isset($ipToSubnetName[$ip])) {
+                                        continue;
+                                    }
+                                    foreach ($subnets as $subnet) {
+                                        $subnet = (array) $subnet;
+                                        if (isset($subnet['cidr'], $subnet['name'])
+                                            && $this->ipInCidr($ip, $subnet['cidr'])
+                                        ) {
+                                            $ipToSubnetName[$ip] = $subnet['name'];
+                                            $debugMap[$ip] = [
+                                                'subnet_name' => $subnet['name'],
+                                                'method'      => 'cidr',
+                                            ];
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Logger::info(sprintf(
+                                'OTC ImportSource: server %s – CIDR resolved %d IP(s)',
+                                $serverId, count($ipToSubnetName)
+                            ));
+                        }
+
+                        // Collect all IPs for this server to find unresolved ones
+                        $allIps = [];
+                        if (!empty($resource['addresses']) && is_array($resource['addresses'])) {
+                            foreach ($resource['addresses'] as $addrList) {
+                                foreach ((array) $addrList as $addrObj) {
+                                    $ip = ((array) $addrObj)['addr'] ?? null;
+                                    if ($ip !== null) {
+                                        $allIps[$ip] = true;
+                                    }
+                                }
+                            }
+                        }
+                        $unresolvedIps = array_diff_key($allIps, $ipToSubnetName);
+
+                        // --- Tier 2: Ports API (only for IPs CIDR could not resolve) ---
+                        // OTC Cloud ports carry subnet info in the `fixed_ips` array
+                        // (each entry: {subnet_id, ip_address}), not a top-level field.
+                        if (!empty($unresolvedIps)) {
+                            $serverPortUrl = $networkEndpoint . '/ports?device_id=' . $serverId;
+                            Logger::info('OTC ImportSource: fetching ports for server ' . $serverId . ' via ' . $serverPortUrl);
+                            $serverPortPages = $this->client->get($serverPortUrl);
+                            $serverPorts     = $this->client->extractResources($serverPortPages);
+                            Logger::info(sprintf('OTC ImportSource: server %s has %d port(s)', $serverId, count($serverPorts)));
+
+                            foreach ($serverPorts as $port) {
+                                $port = (array) $port;
+
+                                if (!isset($port['mac_address'], $port['fixed_ips'])) {
+                                    Logger::info(sprintf(
+                                        'OTC ImportSource: server %s – port missing mac_address or'
+                                        . ' fixed_ips, skipping. Available keys: [%s]',
+                                        $serverId, implode(', ', array_keys($port))
+                                    ));
+                                    continue;
+                                }
+
+                                $mac      = $port['mac_address'];
+                                $fixedIps = (array) $port['fixed_ips'];
+
+                                Logger::info(sprintf(
+                                    'OTC ImportSource: server %s – port mac=%s has %d fixed_ip(s)',
+                                    $serverId, $mac, count($fixedIps)
+                                ));
+
+                                foreach ($fixedIps as $fixedIp) {
+                                    $fixedIp  = (array) $fixedIp;
+                                    $subnetId = $fixedIp['subnet_id'] ?? null;
+                                    $ipAddr   = $fixedIp['ip_address'] ?? null;
+
+                                    if ($subnetId === null) {
+                                        Logger::info(sprintf(
+                                            'OTC ImportSource: server %s mac=%s – fixed_ip entry'
+                                            . ' has no subnet_id, skipping. Keys: [%s]',
+                                            $serverId, $mac, implode(', ', array_keys($fixedIp))
+                                        ));
+                                        continue;
+                                    }
+
+                                    // If this IP was already resolved via CIDR, just populate
+                                    // the MAC fallback and skip another API call.
+                                    if ($ipAddr !== null && isset($ipToSubnetName[$ipAddr])) {
+                                        $macToSubnetName[$mac] = $ipToSubnetName[$ipAddr];
+                                        continue;
+                                    }
+
+                                    // Resolve subnet_id → subnet_name (cached).
+                                    //
+                                    // GET /subnets/{uuid} returns {"subnet": {...}} (singular
+                                    // wrapper), NOT a list.  extractResources() expects an indexed
+                                    // array and returns [] for detail responses – use direct key
+                                    // access instead.
+                                    if (!isset($subnetIdCache[$subnetId])) {
+                                        try {
+                                            $detailUrl    = $networkEndpoint . '/subnets/' . $subnetId;
+                                            Logger::info(
+                                                'OTC ImportSource: fetching subnet detail for '
+                                                . $subnetId . ' via ' . $detailUrl
+                                            );
+                                            $detailPages  = $this->client->get($detailUrl);
+                                            $detailSubnet = $detailPages[0]['subnet'] ?? null;
+                                            if ($detailSubnet !== null && isset($detailSubnet['name'])) {
+                                                $subnetIdCache[$subnetId] = $detailSubnet['name'];
+                                                Logger::info(
+                                                    'OTC ImportSource: subnet_id ' . $subnetId
+                                                    . ' → subnet_name "' . $detailSubnet['name'] . '"'
+                                                );
+                                            } else {
+                                                $subnetIdCache[$subnetId] = $subnetId;
+                                                Logger::info(
+                                                    'OTC ImportSource: subnet_id ' . $subnetId
+                                                    . ' – no name returned, keeping UUID as name'
+                                                );
+                                            }
+                                        } catch (\Exception $e) {
+                                            Logger::warning(
+                                                'OTC ImportSource: subnet detail lookup failed for '
+                                                . $subnetId . ': ' . $e->getMessage()
+                                            );
+                                            $subnetIdCache[$subnetId] = $subnetId;
+                                        }
+                                    }
+
+                                    $subnetName = $subnetIdCache[$subnetId];
+
+                                    // Per-IP mapping (1:1 – one IP belongs to exactly one subnet)
+                                    if ($ipAddr !== null) {
+                                        $ipToSubnetName[$ipAddr] = $subnetName;
+                                        $debugMap[$ipAddr] = [
+                                            'mac'         => $mac,
+                                            'subnet_id'   => $subnetId,
+                                            'subnet_name' => $subnetName,
+                                            'method'      => 'ports-api',
+                                        ];
+                                        Logger::info(sprintf(
+                                            'OTC ImportSource: server %s – RESOLVED'
+                                            . ' mac=%s  ip=%s  subnet_id=%s  subnet_name=%s',
+                                            $serverId, $mac, $ipAddr, $subnetId, $subnetName
+                                        ));
+                                    }
+
+                                    // MAC fallback: last fixed_ip wins when multiple exist per port
+                                    $macToSubnetName[$mac] = $subnetName;
+                                }
+                            }
+                        }
+
+                        Logger::info(sprintf(
+                            'OTC ImportSource: server %s – ip→subnet map: %s',
+                            $serverId, json_encode($ipToSubnetName)
+                        ));
+
+                        // Enrich addresses: prefer ip→subnet (precise), fall back to mac→subnet
+                        if (isset($resource['addresses']) && is_array($resource['addresses'])) {
+                            if (!empty($ipToSubnetName)) {
+                                Logger::info(sprintf(
+                                    'OTC ImportSource: enriching server %s with %d ip→subnet mapping(s)',
+                                    $serverId, count($ipToSubnetName)
+                                ));
+                                $this->enrichResourceAddresses($resource, $macToSubnetName, $networks, $ipToSubnetName);
+                            } elseif (!empty($macToSubnetName)) {
+                                Logger::info(sprintf(
+                                    'OTC ImportSource: enriching server %s with %d mac→subnet'
+                                    . ' mapping(s) (ip fallback)',
+                                    $serverId, count($macToSubnetName)
+                                ));
+                                $this->enrichResourceAddresses($resource, $macToSubnetName, $networks);
+                            }
+                        }
+
+                        // Debug property – always written so the column appears in
+                        // Director's preview even for servers with no enrichment data.
+                        // Keyed by IP: {ip: {subnet_name, method, [mac, subnet_id]}}
+                        $resource['addresses_debug'] = $debugMap;
+                    } catch (\Exception $e) {
+                        Logger::warning('OTC ImportSource: ports lookup failed for server ' . $serverId . ': ' . $e->getMessage());
+                    }
+                }
+                unset($resource);
             } catch (\Exception $e) {
-                Logger::warning(
-                    'OTC ImportSource: subnet name enrichment failed, addresses remain as-is – '
-                    . $e->getMessage()
-                );
+                Logger::warning('OTC ImportSource: address enrichment failed – ' . $e->getMessage());
             }
         }
 
@@ -140,7 +394,7 @@ class ImportSource extends ImportSourceHook
         $form->addElement('text', 'service_type', [
             'label'       => 'Service Type',
             'required'    => true,
-            'description' => 'OpenStack service catalog type, e.g. compute, network',
+            'description' => 'OpenStack / OTC service catalog type, e.g. compute, network',
         ]);
 
         $form->addElement('text', 'resource_path', [
@@ -150,15 +404,25 @@ class ImportSource extends ImportSourceHook
         ]);
 
         $form->addElement('select', 'enrich_subnet_names', [
-            'label'       => 'Enrich addresses with subnet names',
-            'description' => 'Re-key the addresses map from network UUIDs to subnet names via CIDR lookup. '
-                           . 'Requires a network endpoint in the service catalog. '
-                           . 'Enable for compute resources to allow key-pattern IP selection.',
+            'label'       => 'Enrich addresses with subnet/network names',
+            'description' => 'Re-key the addresses map from network UUIDs to subnet names via CIDR lookup, '
+                            . 'falling back to the Ports API when CIDR is ambiguous (Shared VPC). '
+                            . 'Requires a network endpoint in the service catalog. '
+                            . 'Enable for compute resources to allow key-pattern IP selection.',
             'value'       => 'false',
             'multiOptions' => [
                 'false' => 'No',
                 'true'  => 'Yes',
             ],
+        ]);
+
+        $form->addElement('text', 'network_api_path', [
+            'label'       => 'Network API Path Prefix',
+            'required'    => false,
+            'value'       => 'v2.0',
+            'description' => 'Version prefix appended to the network endpoint when the service catalog '
+                           . 'does not include it (OTC/Huawei Cloud VPC returns a bare host URL). '
+                           . 'Default: v2.0  →  https://vpc.../v2.0/subnets',
         ]);
 
         $form->addElement('text', 'proxy', [
@@ -180,8 +444,10 @@ class ImportSource extends ImportSourceHook
     }
 
     /**
-     * Columns are derived from the top-level keys of the first returned resource.
-     * No hardcoding – every field the API returns is available automatically.
+     * Columns are derived from the union of all top-level keys across all
+     * returned resources.  No hardcoding – every field the API returns is
+     * available automatically, including enrichment-only columns like
+     * addresses_debug which may not be present on every object.
      */
     public function listColumns()
     {
@@ -204,69 +470,64 @@ class ImportSource extends ImportSourceHook
     // ── private helpers ───────────────────────────────────────────────────────
 
     /**
-     * Re-key the `addresses` map of each resource from opaque network UUIDs (or
-     * VPC names) to the human-readable OTC subnet names that the IPs belong to.
+     * Enrich a single resource's addresses using ip→subnet_name (preferred)
+     * and mac→subnet_name (fallback) mappings from the per-server ports lookup.
      *
-     * Before enrichment a multi-NIC VM looks like:
-     *   addresses = {
-     *     "791f9f9f-uuid": [
-     *       {"addr": "192.0.2.50"},
-     *       {"addr": "192.0.2.82"},
-     *       {"addr": "192.0.2.66"},
-     *     ]
-     *   }
+     * Resolution order per address entry:
+     *   1. ip_address  → subnet_name  (precise: 1 IP = 1 subnet)
+     *   2. mac_address → subnet_name  (fallback: last fixed_ip wins per port)
+     *   3. network UUID → network name (via /networks)
+     *   4. networkKey:ip              (last resort)
      *
-     * After enrichment (with subnet CIDRs 192.0.2.48/28 → "example-data-subnet", etc.):
-     *   addresses = {
-     *     "example-data-subnet": [{"addr": "192.0.2.50"}],
-     *     "example-mgmt-subnet": [{"addr": "192.0.2.82"}],
-     *     "example-app-subnet":  [{"addr": "192.0.2.66"}],
-     *   }
-     *
-     * IPs that do not fall into any known subnet CIDR are kept under their
-     * original network key.
-     *
-     * @param array $resources  flat list of resource arrays (modified in-place)
-     * @param array $subnets    list of subnet arrays each with 'name' and 'cidr'
-     * @return array
+     * @param array $resource         modified in-place
+     * @param array $macToSubnetName  mac_address → subnet_name
+     * @param array $networks         for UUID → name fallback
+     * @param array $ipToSubnetName   ip_address  → subnet_name (optional, preferred)
      */
-    private function enrichAddressesWithSubnetNames(array $resources, array $subnets): array
+    private function enrichResourceAddresses(array &$resource, array $macToSubnetName, array $networks, array $ipToSubnetName = []): void
     {
-        foreach ($resources as &$resource) {
-            if (empty($resource['addresses']) || ! is_array($resource['addresses'])) {
-                continue;
+        $networkMap = [];
+        foreach ($networks as $net) {
+            if (isset($net['id'], $net['name'])) {
+                $networkMap[$net['id']] = $net['name'];
             }
-
-            $enriched = [];
-
-            foreach ($resource['addresses'] as $networkKey => $addrList) {
-                foreach ((array) $addrList as $addrObj) {
-                    $ip         = $addrObj['addr'] ?? null;
-                    $subnetName = null;
-
-                    if ($ip !== null) {
-                        foreach ($subnets as $subnet) {
-                            if (isset($subnet['cidr'], $subnet['name'])
-                                && $this->ipInCidr($ip, $subnet['cidr'])
-                            ) {
-                                $subnetName = $subnet['name'];
-                                break;
-                            }
-                        }
-                    }
-
-                    // Each IP gets its own key; unknown IPs fall back to the
-                    // original network key (suffixed with the IP to avoid collisions).
-                    $key             = $subnetName ?? ($networkKey . ':' . ($ip ?? 'unknown'));
-                    $enriched[$key]  = [$addrObj];
-                }
-            }
-
-            $resource['addresses'] = $enriched;
         }
 
-        unset($resource);
-        return $resources;
+        $enriched = [];
+        foreach ($resource['addresses'] as $networkKey => $addrList) {
+            foreach ((array) $addrList as $addrObj) {
+                $addrArr = (array) $addrObj;
+                $mac  = $addrArr['OS-EXT-IPS-MAC:mac_addr'] ?? null;
+                $ip   = $addrArr['addr'] ?? null;
+                $name = null;
+
+                // Tier 1: IP-based mapping (1:1 – most precise)
+                if ($ip !== null && isset($ipToSubnetName[$ip])) {
+                    $name = $ipToSubnetName[$ip];
+                }
+
+                // Tier 2: MAC-based mapping fallback
+                if ($name === null && $mac !== null && isset($macToSubnetName[$mac])) {
+                    $name = $macToSubnetName[$mac];
+                }
+
+                // Tier 3: Network UUID → network name
+                if ($name === null && isset($networkMap[$networkKey])) {
+                    $name = $networkMap[$networkKey];
+                }
+
+                // Final fallback: keep UUID + IP so the data is not lost
+                if ($name === null) {
+                    $name = $networkKey . ':' . $ip;
+                }
+
+                if (!isset($enriched[$name])) {
+                    $enriched[$name] = [];
+                }
+                $enriched[$name][] = $addrObj;
+            }
+        }
+        $resource['addresses'] = $enriched;
     }
 
     /**

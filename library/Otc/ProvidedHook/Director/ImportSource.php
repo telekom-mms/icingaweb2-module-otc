@@ -137,7 +137,7 @@ class ImportSource extends ImportSourceHook
                         $ipToSubnetName  = [];  // ip_address  → subnet_name  (precise, per IP)
                         $macToSubnetName = [];  // mac_address → subnet_name  (fallback)
                         $subnetIdCache   = [];  // subnet_id   → subnet_name  (avoids duplicate API calls)
-                        $debugMap        = [];  // written to addresses_debug for inspection
+
 
                         // --- Tier 1: CIDR pre-matching (no extra API calls) ---
                         // Match every IP in this server's addresses against the
@@ -321,10 +321,7 @@ class ImportSource extends ImportSourceHook
                             }
                         }
 
-                        // Debug property – always written so the column appears in
-                        // Director's preview even for servers with no enrichment data.
-                        // Keyed by IP: {ip: {subnet_name, method, [mac, subnet_id]}}
-                        $resource['addresses_debug'] = $debugMap;
+
                     } catch (\Exception $e) {
                         Logger::warning('OTC ImportSource: ports lookup failed for server ' . $serverId . ': ' . $e->getMessage());
                     }
@@ -446,8 +443,7 @@ class ImportSource extends ImportSourceHook
     /**
      * Columns are derived from the union of all top-level keys across all
      * returned resources.  No hardcoding – every field the API returns is
-     * available automatically, including enrichment-only columns like
-     * addresses_debug which may not be present on every object.
+     * available automatically.
      */
     public function listColumns()
     {

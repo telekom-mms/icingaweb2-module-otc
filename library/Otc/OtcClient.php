@@ -462,8 +462,7 @@ class OtcClient
      * These are the fields available for Icinga Director sync rules.
      *
      * Iterating all resources (not just $resources[0]) ensures that columns
-     * which appear only on some objects – e.g. "addresses_debug" added during
-     * enrichment – are visible in Director's column picker.
+     * which appear only on some objects are visible in Director's column picker.
      *
      * @param  array $resources  as returned by extractResources()
      * @return array

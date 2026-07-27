@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/telekom-mms/icingaweb2-module-otc/tree/1.0.1) (2026-07-27)
+
+[Full Changelog](https://github.com/telekom-mms/icingaweb2-module-otc/compare/1.0.0...1.0.1)
+
+**Implemented enhancements:**
+
+- feat: add subnet-name enrichment and key-pattern property modifier [\#2](https://github.com/telekom-mms/icingaweb2-module-otc/pull/2) ([mikaEz](https://github.com/mikaEz))
+
 ## [1.0.0](https://github.com/telekom-mms/icingaweb2-module-otc/tree/1.0.0) (2026-06-22)
 
 [Full Changelog](https://github.com/telekom-mms/icingaweb2-module-otc/compare/4deb11cb421649d33fe6120c4b9b36cdab80f921...1.0.0)

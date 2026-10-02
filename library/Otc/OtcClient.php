@@ -20,6 +20,8 @@ class OtcClient
     private $domain;
     private $project;
     private $auth_type;
+    private $agency_name;
+    private $user_project;
 
     /** @var string|null  current bearer token */
     private $token = null;
@@ -45,7 +47,9 @@ class OtcClient
         $auth_type   = 'password',
         $proxy       = '',
         $con_timeout = 0,
-        $timeout     = 0
+        $timeout     = 0,
+        $agency_name  = '',
+        $user_project = ''
     ) {
         $this->iam_url   = rtrim($iam_url, '/');
         $this->username  = $username;
@@ -53,6 +57,8 @@ class OtcClient
         $this->domain    = $domain;
         $this->project   = $project;
         $this->auth_type = $auth_type;
+        $this->agency_name  = $agency_name;
+        $this->user_project = $user_project;
 
         $this->curl_opts = [
             CURLOPT_CONNECTTIMEOUT => (int) $con_timeout,
@@ -66,12 +72,14 @@ class OtcClient
     // ── authentication ────────────────────────────────────────────────────────
 
     /**
-     * Dispatch to password or AK/SK authentication.
+     * Dispatch to password, AK/SK or agency authentication.
      */
     private function authenticate()
     {
         if ($this->auth_type === 'aksk') {
-            $this->authenticateAkSk();
+            $this->authenticateAkSk($this->project);
+        } elseif ($this->auth_type === 'agency') {
+            $this->authenticateAgency();
         } else {
             $this->authenticatePassword();
         }
@@ -156,13 +164,13 @@ class OtcClient
      * Authenticate with OTC AK/SK credentials (SDK-HMAC-SHA256 request signing).
      * The signed request is sent to the standard Keystone v3 token endpoint.
      * On success the X-Subject-Token and service catalog are stored.
+     *
+     * @param string $project  project name to scope the token to
      */
-    private function authenticateAkSk()
+    private function authenticateAkSk($project)
     {
         Logger::info('OTC: authenticating (AK/SK) against ' . $this->iam_url);
 
-        $host = $this->iamHost();
-        $path = '/v3/auth/tokens';
         $body = json_encode([
             'auth' => [
                 'identity' => [
@@ -173,18 +181,76 @@ class OtcClient
                     ],
                 ],
                 'scope' => [
-                    'project' => ['name' => $this->project],
+                    'project' => ['name' => $project],
                 ],
             ],
         ]);
 
-        $headers      = $this->buildAkSkHeaders('POST', $host, $path, $body);
+        $headers      = $this->buildAkSkHeaders('POST', $this->iamHost(), '/v3/auth/tokens', $body);
         $http_headers = [];
         foreach ($headers as $k => $v) {
             $http_headers[] = $k . ': ' . $v;
         }
 
-        $ch = curl_init($this->iam_url . $path);
+        $this->requestToken($body, $http_headers, 'AK/SK');
+
+        Logger::info(sprintf(
+            'OTC: authenticated via AK/SK, project_id=%s, token valid until %s',
+            $this->project_id,
+            date('c', $this->expires)
+        ));
+    }
+
+    /**
+     * Authenticate via an IAM agency: get an AK/SK user token scoped to
+     * user_project (default: project), then assume the agency `agency_name`
+     * in domain `domain`, scoped to `project`.
+     */
+    private function authenticateAgency()
+    {
+        $this->authenticateAkSk($this->user_project !== '' ? $this->user_project : $this->project);
+
+        Logger::info(sprintf(
+            'OTC: assuming agency %s in domain %s',
+            $this->agency_name,
+            $this->domain
+        ));
+
+        $body = json_encode([
+            'auth' => [
+                'identity' => [
+                    'methods'     => ['assume_role'],
+                    'assume_role' => [
+                        'domain_name' => $this->domain,
+                        'xrole_name'  => $this->agency_name,
+                    ],
+                ],
+                'scope' => [
+                    'project' => ['name' => $this->project],
+                ],
+            ],
+        ]);
+
+        $this->requestToken($body, [
+            'Content-Type: application/json',
+            'X-Auth-Token: ' . $this->token,
+        ], 'agency');
+
+        Logger::info(sprintf(
+            'OTC: authenticated via agency, project_id=%s, token valid until %s',
+            $this->project_id,
+            date('c', $this->expires)
+        ));
+    }
+
+    /**
+     * POST to /v3/auth/tokens and store the X-Subject-Token, expiry,
+     * service catalog and project ID. Accepts HTTP 200 and 201
+     * (assume_role answers 200).
+     */
+    private function requestToken($body, array $http_headers, $label)
+    {
+        $ch = curl_init($this->iam_url . '/v3/auth/tokens');
         curl_setopt_array($ch, $this->curl_opts + [
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => $body,
@@ -200,19 +266,21 @@ class OtcClient
         curl_close($ch);
 
         if ($err) {
-            throw new QueryException('OTC AK/SK auth cURL error: ' . $err);
+            throw new QueryException(sprintf('OTC %s auth cURL error: %s', $label, $err));
         }
-        if ($http !== 201) {
+        if ($http !== 200 && $http !== 201) {
             throw new QueryException(sprintf(
-                'OTC AK/SK auth failed (HTTP %d): %s',
+                'OTC %s auth failed (HTTP %d): %s',
+                $label,
                 $http,
                 substr($raw, $hdr_size)
             ));
         }
 
-        $raw_headers = substr($raw, 0, $hdr_size);
-        if (!preg_match('/^X-Subject-Token:\s*(\S+)/mi', $raw_headers, $m)) {
-            throw new QueryException('OTC AK/SK auth: X-Subject-Token missing from response');
+        // The token itself lives in the response header, not the body
+        $headers = substr($raw, 0, $hdr_size);
+        if (!preg_match('/^X-Subject-Token:\s*(\S+)/mi', $headers, $m)) {
+            throw new QueryException(sprintf('OTC %s auth: X-Subject-Token missing from response', $label));
         }
         $this->token = $m[1];
 
@@ -220,12 +288,6 @@ class OtcClient
         $this->expires    = strtotime($data['token']['expires_at'] ?? '+1 hour');
         $this->catalog    = $data['token']['catalog']        ?? [];
         $this->project_id = $data['token']['project']['id'] ?? null;
-
-        Logger::info(sprintf(
-            'OTC: authenticated via AK/SK, project_id=%s, token valid until %s',
-            $this->project_id,
-            date('c', $this->expires)
-        ));
     }
 
     /**
@@ -254,43 +316,7 @@ class OtcClient
             ],
         ]);
 
-        $ch = curl_init($this->iam_url . '/v3/auth/tokens');
-        curl_setopt_array($ch, $this->curl_opts + [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => $body,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER         => true,           // include response headers
-            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        ]);
-
-        $raw      = curl_exec($ch);
-        $http     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $hdr_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-        $err      = curl_error($ch);
-        curl_close($ch);
-
-        if ($err) {
-            throw new QueryException('OTC auth cURL error: ' . $err);
-        }
-        if ($http !== 201) {
-            throw new QueryException(sprintf(
-                'OTC auth failed (HTTP %d): %s',
-                $http,
-                substr($raw, $hdr_size)
-            ));
-        }
-
-        // The token itself lives in the response header, not the body
-        $headers = substr($raw, 0, $hdr_size);
-        if (!preg_match('/^X-Subject-Token:\s*(\S+)/mi', $headers, $m)) {
-            throw new QueryException('OTC auth: X-Subject-Token missing from response');
-        }
-        $this->token = $m[1];
-
-        $data = json_decode(substr($raw, $hdr_size), true);
-        $this->expires    = strtotime($data['token']['expires_at'] ?? '+1 hour');
-        $this->catalog    = $data['token']['catalog']        ?? [];
-        $this->project_id = $data['token']['project']['id'] ?? null;
+        $this->requestToken($body, ['Content-Type: application/json'], 'password');
 
         Logger::info(sprintf(
             'OTC: authenticated as %s, project_id=%s, token valid until %s',

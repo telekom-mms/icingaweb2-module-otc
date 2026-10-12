@@ -46,7 +46,9 @@ class ImportSource extends ImportSourceHook
             $this->getSetting('auth_type', 'password'),
             $this->getSetting('proxy', ''),
             (int) $this->getSetting('con_timeout', 0),
-            (int) $this->getSetting('timeout', 0)
+            (int) $this->getSetting('timeout', 0),
+            $this->getSetting('agency_name', ''),
+            $this->getSetting('user_project', '')
         );
 
         $service_type  = $this->getSetting('service_type');
@@ -355,6 +357,7 @@ class ImportSource extends ImportSourceHook
             'multiOptions' => [
                 'password' => 'Username / Password',
                 'aksk'     => 'Access Key / Secret Key (AK/SK)',
+                'agency'   => 'AK/SK + assume IAM agency',
             ],
             'value'       => 'password',
         ]);
@@ -374,13 +377,25 @@ class ImportSource extends ImportSourceHook
         $form->addElement('text', 'domain', [
             'label'       => 'Domain Name',
             'required'    => false,
-            'description' => 'OTC account domain, e.g. OTC0000123456. Required for password auth; not used for AK/SK.',
+            'description' => 'OTC account domain, e.g. OTC0000123456. Required for password auth; not used for AK/SK. Agency auth: domain that owns the agency.',
         ]);
 
         $form->addElement('text', 'project', [
             'label'       => 'Project / Region',
             'required'    => true,
-            'description' => 'Project name (usually the region), e.g. eu-de',
+            'description' => 'Project name (usually the region), e.g. eu-de. Agency auth: project in the agency domain.',
+        ]);
+
+        $form->addElement('text', 'agency_name', [
+            'label'       => 'Agency Name',
+            'required'    => false,
+            'description' => 'Agency auth only: name of the IAM agency to assume.',
+        ]);
+
+        $form->addElement('text', 'user_project', [
+            'label'       => 'User Project (optional)',
+            'required'    => false,
+            'description' => 'Agency auth only: project the AK/SK user token is scoped to before assuming the agency. Defaults to Project / Region.',
         ]);
 
         $form->addElement('text', 'region', [

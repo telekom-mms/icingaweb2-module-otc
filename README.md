@@ -31,15 +31,34 @@ In Icinga Director go to **Automation → Import Source → Add** and select
 | Field | Required | Description |
 |-------|----------|-------------|
 | IAM URL | ✔ | Keystone v3 base URL, e.g. `https://iam.eu-de.otc.t-systems.com` |
-| Username | ✔ | OTC IAM user name |
-| Password | ✔ | OTC IAM password |
-| Domain Name | ✔ | Account domain, e.g. `OTC0000123456` |
+| Authentication Type | ✔ | `password`, `aksk` or `agency` (see below) |
+| Username | ✔ | OTC IAM user name, or Access Key (AK) |
+| Password | ✔ | OTC IAM password, or Secret Key (SK) |
+| Domain Name | | Account domain, e.g. `OTC0000123456`. Required for `password` and `agency` |
 | Project / Region | ✔ | Project name, usually equals the region, e.g. `eu-de` |
+| Agency Name | | `agency` only: IAM agency to assume |
+| User Project | | `agency` only: project the AK/SK user token is scoped to first, defaults to Project / Region |
 | Region Filter | | Narrow endpoint lookup to a specific region |
 | Service Type | ✔ | OpenStack service catalog type (see table below) |
 | Resource Path | ✔ | Path within the service endpoint (see table below) |
 | HTTP Proxy | | Optional proxy URL |
 | Connect / Request Timeout | | cURL timeouts in seconds; `0` = no limit |
+
+### Agency authentication
+
+With `agency` the module authenticates with AK/SK in its own account, then
+assumes the agency **Agency Name** in **Domain Name** (`assume_role`),
+scoped to **Project / Region** of that domain. This lets one monitoring
+user read resources of other accounts, e.g. list their projects:
+
+| Field | Value |
+|-------|-------|
+| Authentication Type | `agency` |
+| Domain Name | `OTC0000999999` (account that owns the agency) |
+| Project / Region | `eu-de` |
+| Agency Name | `my_readonly_agency` |
+| Service Type | `identity` |
+| Resource Path | `/projects` |
 
 Common service types and resource paths
 ---------------------------------------
